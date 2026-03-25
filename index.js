@@ -41,7 +41,6 @@ async function fetchPlacesFromSerpApi(destination, limit = 20) {
     engine: 'google_maps',
     type: 'search',
     q: `things to do in ${destination}`,
-    hl: 'zh-hk',
     api_key: SERPAPI_KEY            // 這裡要是你 Playground 那條 key
   });
 
