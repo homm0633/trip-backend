@@ -4,13 +4,14 @@ const fetch = require('node-fetch'); // node-fetch v2
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔑 在這裡填你的 SerpApi 金鑰
-const SERPAPI_KEY = '5df2e19b0bdc181d569a9e23c8a11b4661c41705aa2319b49f689f2e09491ac0';
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const OTM_API_KEY = process.env.OPENTRIPMAP_KEY;
 
-// （可選）仍保留 OpenTripMap geocode，用來把目的地名字標準化
-const OTM_API_KEY = '5ae2e3f221c38a28845f05b6d06fa9a378207ab7512f2d98c57b65e8';
+console.log('[ENV] SERPAPI_KEY =', SERPAPI_KEY ? 'SET' : 'MISSING');
+console.log('[ENV] OTM_API_KEY =', OTM_API_KEY ? 'SET' : 'MISSING');
 
-// 用地名查座標（OpenTripMap），只是為了拿到較標準的城市名稱
+// ---------- Geocode: OpenTripMap ----------
+
 async function geocodeDestination(name) {
   console.log('typeof fetch inside geocode =', typeof fetch);
   console.log('[geocodeDestination] name =', name);
@@ -33,13 +34,14 @@ async function geocodeDestination(name) {
   return { lat: data.lat, lon: data.lon, name: data.name || name };
 }
 
-// 從 SerpApi 的 Google Maps 拿景點
+// ---------- SerpApi: Google Maps ----------
+
 async function fetchPlacesFromSerpApi(destination, limit = 20) {
   const params = new URLSearchParams({
     engine: 'google_maps',
     type: 'search',
-    q: `things to do in ${destination}`, // 可以改成 attractions, sightseeing 等
-    api_key: SERPAPI_KEY
+    q: `things to do in ${destination}`,
+    api_key: SERPAPI_KEY            // 這裡要是你 Playground 那條 key
   });
 
   const url = `https://serpapi.com/search.json?${params.toString()}`;
@@ -57,17 +59,16 @@ async function fetchPlacesFromSerpApi(destination, limit = 20) {
   const results = data.local_results || [];
   console.log('[SerpApi] results count =', results.length);
 
-  // 轉成 buildItineraryFromPlaces 會用到的格式
+  // 這裡就直接轉成我們自己的格式
   const mapped = results
     .filter(p => p.title && p.gps_coordinates)
     .slice(0, limit)
     .map(p => ({
       name: p.title,
-      kinds: p.type || '', // e.g. "Tourist attraction"
-      point: {
-        lat: p.gps_coordinates.latitude,
-        lon: p.gps_coordinates.longitude
-      },
+      // SerpApi 常見欄位：type / categories / category / place_id...
+      kinds: [p.type, ...(p.categories || [])].filter(Boolean).join(', '),
+      lat: p.gps_coordinates.latitude,
+      lon: p.gps_coordinates.longitude,
       rate: p.rating || 0
     }));
 
@@ -75,54 +76,7 @@ async function fetchPlacesFromSerpApi(destination, limit = 20) {
   return mapped;
 }
 
-// 從景點生成簡單行程
-function buildItineraryFromPlaces(destinationName, places, days = 3) {
-  const sorted = [...places].sort((a, b) => {
-    const ra = a.rate || 0;
-    const rb = b.rate || 0;
-    return rb - ra;
-  });
-
-  const perDay = 5;
-  const maxPlaces = perDay * days;
-  const top = sorted.slice(0, maxPlaces);
-
-  const dayPlans = [];
-
-  for (let day = 1; day <= days; day++) {
-    const start = (day - 1) * perDay;
-    const chunk = top.slice(start, start + perDay);
-    if (chunk.length === 0) break;
-
-    const title = makeDayTitle(day, destinationName);
-    const placesSimplified = chunk.map(p => ({
-      name: p.name,
-      kinds: p.kinds || '',
-      lat: p.point.lat,
-      lon: p.point.lon
-    }));
-
-    dayPlans.push({
-      day,
-      title,
-      places: placesSimplified
-    });
-  }
-
-  return {
-    destination: destinationName,
-    days: dayPlans
-  };
-}
-
-function makeDayTitle(day, destination) {
-  switch (day) {
-    case 1: return `${destination} 市中心探索`;
-    case 2: return `${destination} 文化與公園`;
-    case 3: return `${destination} 周邊景點`;
-    default: return `${destination} Day ${day}`;
-  }
-}
+// ---------- /api/places：給 App 用 ----------
 
 // GET /api/places?destination=Fukuoka&category=cafe&limit=20
 app.get('/api/places', async (req, res) => {
@@ -137,7 +91,7 @@ app.get('/api/places', async (req, res) => {
 
     console.log('[/api/places] destination =', destination, 'category =', category, 'limit =', limit);
 
-    // 1. geocode
+    // 1. geocode → 拿標準名稱
     let displayName = destination;
     try {
       const geo = await geocodeDestination(destination);
@@ -146,21 +100,20 @@ app.get('/api/places', async (req, res) => {
       console.log('[geocodeDestination] failed, fallback to raw destination');
     }
 
-    // 2. SerpApi 拿地點
+    // 2. SerpApi 拿地點（已是簡化後格式）
     const places = await fetchPlacesFromSerpApi(displayName, limit * 2);
-    console.log('[SerpApi] results count =', places.length);
 
-    // 3. 依 category 過濾
+    // 3. 依 category 過濾（用 kinds 判斷）
     const filtered = filterPlacesByCategory(places, category).slice(0, limit);
 
-    // 4. 回傳簡化結果
-    const result = filtered.map(p => ({
-      id: p.place_id || p.placeId || p.google_id || p.id,
+    // 4. 回傳給 iOS 的結構
+    const result = filtered.map((p, index) => ({
+      id: `${index}-${p.name}`,     // 簡單產生一個 id 給前端
       name: p.name,
-      address: p.formatted_address || p.address,
-      rating: p.rating,
-      latitude: p.location?.lat,
-      longitude: p.location?.lng
+      address: null,               // SerpApi 簡化後沒保留 address，如要可在上面 map 時一起帶
+      rating: p.rate,
+      latitude: p.lat,
+      longitude: p.lon
     }));
 
     return res.json(result);
@@ -170,16 +123,14 @@ app.get('/api/places', async (req, res) => {
   }
 });
 
+// 用 kinds 做簡單分類
 function filterPlacesByCategory(places, category) {
   if (!category || category === 'all') return places;
 
   const lower = category.toLowerCase();
 
   return places.filter(p => {
-    const labels =
-      (p.types || p.category_labels || p.categories || [])
-        .join(' ')
-        .toLowerCase();
+    const labels = (p.kinds || '').toLowerCase();
 
     switch (lower) {
       case 'cafe':
@@ -192,7 +143,8 @@ function filterPlacesByCategory(places, category) {
         return labels.includes('tourist') ||
                labels.includes('attraction') ||
                labels.includes('landmark') ||
-               labels.includes('point_of_interest');
+               labels.includes('point_of_interest') ||
+               labels.includes('sightseeing');
       case 'hotel':
         return labels.includes('hotel') || labels.includes('lodging');
       case 'other':
@@ -202,9 +154,9 @@ function filterPlacesByCategory(places, category) {
   });
 }
 
+// ---------- 啟動 server ----------
 
-
-// 啟動 server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
